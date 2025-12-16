@@ -1,0 +1,373 @@
+"""
+Appendix B: Kinetic Model Code
+Monod Equation 기반 장내미생물 공배양 시뮬레이션
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+
+# =============================================================================
+# 1. Kinetic Parameters 정의
+# =============================================================================
+# 각 균주의 kinetic parameter는 문헌값을 기반으로 설정
+# μ_max: 최대 비성장속도 (maximum specific growth rate, h^-1)
+# Ks: Monod 상수 (half-saturation constant, mM) - 친화도의 역수
+# Y_biomass: 생체량 수율 (yield coefficient, g biomass/g substrate)
+# Y_product: 생성물 수율 (yield coefficient, mol product/mol substrate)
+
+# Bifidobacterium adolescentis (Ba)
+# Glucose를 acetate와 lactate로 발효하는 donor 역할
+params_Ba = {
+    'mu_max': 0.5,       # Amaretti et al. 2007 (0.38-0.60 범위)
+    'Ks_glc': 0.2,       # Glucose에 대한 친화도 (높은 친화도)
+    'Y_biomass': 0.45,   # Glucose 1g당 biomass 0.45g 생성
+    'Y_acetate': 0.7,    # Glucose 1mol당 acetate 0.7mol 생성
+    'Y_lactate': 0.4,    # Glucose 1mol당 lactate 0.4mol 생성
+}
+
+# Faecalibacterium prausnitzii (Fpr)
+# Acetate를 butyrate로 전환하는 receiver 역할
+params_Fpr = {
+    'mu_max': 0.30,      # El-Semman et al. 2014 (acetate 의존적 성장)
+    'Ks_ac': 7.0,        # Acetate에 대한 친화도 (중간)
+    'Y_biomass': 0.30,   # Acetate 1g당 biomass 0.30g 생성
+    'Y_butyrate': 0.5,   # Acetate 1mol당 butyrate 0.5mol 생성
+}
+
+# Anaerostipes caccae (Ac)
+# Lactate와 acetate를 butyrate로 전환
+params_Ac = {
+    'mu_max': 0.25,      # Muñoz-Tamayo et al. 2011
+    'Ks_ac': 10.0,       # Acetate에 대한 친화도 (낮음)
+    'Y_biomass': 0.25,
+    'Y_butyrate': 0.4,
+}
+
+# Agathobacter rectalis (Ar)
+# Acetate를 butyrate로 전환
+params_Ar = {
+    'mu_max': 0.30,      # Duncan et al. 2002
+    'Ks_ac': 8.0,
+    'Y_biomass': 0.30,
+    'Y_butyrate': 0.5,
+}
+
+# =============================================================================
+# 2. 단독배양 모델 - Donor (Ba)
+# =============================================================================
+def monoculture_Ba(y, t, params):
+    """
+    B. adolescentis 단독배양 ODE 시스템
+    
+    State variables:
+    - X: Biomass (g/L)
+    - Glc: Glucose 농도 (mM)
+    - Ac: Acetate 농도 (mM)
+    - Lac: Lactate 농도 (mM)
+    
+    Monod equation: μ = μ_max * S / (Ks + S)
+    여기서 S는 제한 기질(limiting substrate) 농도
+    """
+    X, Glc, Ac, Lac = y
+    
+    # Monod kinetics로 비성장속도 계산
+    # Glucose 농도가 높을수록 성장속도가 빠르지만, μ_max를 초과할 수 없음
+    mu = params['mu_max'] * Glc / (params['Ks_glc'] + Glc)
+    
+    # ODE 정의
+    # dX/dt: Biomass 증가율 = μ × X
+    dX = mu * X
+    
+    # dGlc/dt: Glucose 소비율 = -(μ × X) / Y_biomass
+    # 음수는 소비를 의미, Y_biomass는 biomass 생성 효율
+    dGlc = -mu * X / params['Y_biomass']
+    
+    # dAc/dt: Acetate 생산율 = Y_acetate × (-dGlc)
+    # Glucose 소비량에 비례하여 acetate 생성
+    dAc = params['Y_acetate'] * (-dGlc)
+    
+    # dLac/dt: Lactate 생산율
+    dLac = params['Y_lactate'] * (-dGlc)
+    
+    return [dX, dGlc, dAc, dLac]
+
+# =============================================================================
+# 3. 단독배양 모델 - Receiver (Fpr, Ac, Ar)
+# =============================================================================
+def monoculture_receiver(y, t, params):
+    """
+    Butyrate 생산균(Fpr, Ac, Ar) 단독배양 ODE 시스템
+    
+    State variables:
+    - X: Biomass (g/L)
+    - Ac: Acetate 농도 (mM)
+    - But: Butyrate 농도 (mM)
+    
+    이들 균주는 acetate를 소비하여 butyrate를 생성
+    """
+    X, Ac, But = y
+    
+    # Monod kinetics
+    mu = params['mu_max'] * Ac / (params['Ks_ac'] + Ac)
+    
+    # ODE 정의
+    dX = mu * X
+    
+    # Acetate 소비 (음수)
+    dAc = -mu * X / params['Y_biomass']
+    
+    # Butyrate 생성 (양수)
+    # Acetate 소비량에 비례하여 butyrate 생성
+    dBut = params['Y_butyrate'] * (-dAc)
+    
+    return [dX, dAc, dBut]
+
+# =============================================================================
+# 4. 공배양 모델 - Cross-feeding
+# =============================================================================
+def coculture_Ba_receiver(y, t, params_Ba, params_rcv):
+    """
+    B. adolescentis + Receiver 공배양 ODE 시스템
+    
+    핵심: Shared acetate pool
+    - Ba가 glucose로부터 acetate 생성 (dAc > 0)
+    - Receiver가 acetate로부터 butyrate 생성 (dAc < 0)
+    - 두 균주가 동일한 acetate pool을 공유하므로 cross-feeding 발생
+    
+    State variables:
+    - X_Ba: Ba biomass
+    - X_rcv: Receiver biomass
+    - Glc: Glucose (Ba만 사용)
+    - Ac: Acetate (shared pool, 핵심!)
+    - But: Butyrate (Receiver만 생성)
+    - Lac: Lactate (Ba만 생성)
+    """
+    X_Ba, X_rcv, Glc, Ac, But, Lac = y
+    
+    # Ba의 성장 (glucose 의존)
+    mu_Ba = params_Ba['mu_max'] * Glc / (params_Ba['Ks_glc'] + Glc)
+    
+    # Receiver의 성장 (acetate 의존)
+    mu_rcv = params_rcv['mu_max'] * Ac / (params_rcv['Ks_ac'] + Ac)
+    
+    # Biomass 변화율
+    dX_Ba = mu_Ba * X_Ba
+    dX_rcv = mu_rcv * X_rcv
+    
+    # Glucose 소비 (Ba만)
+    dGlc = -mu_Ba * X_Ba / params_Ba['Y_biomass']
+    
+    # Acetate 변화율 (핵심!)
+    # Ba의 acetate 생산 (+)
+    dAc_Ba = params_Ba['Y_acetate'] * (-dGlc)
+    
+    # Receiver의 acetate 소비 (-)
+    dAc_rcv = -mu_rcv * X_rcv / params_rcv['Y_biomass']
+    
+    # 총 acetate 변화율 = 생산 + 소비
+    # 이것이 cross-feeding의 핵심: Ba가 생산 → Receiver가 소비
+    dAc = dAc_Ba + dAc_rcv
+    
+    # Butyrate 생성 (Receiver만)
+    dBut = params_rcv['Y_butyrate'] * (-dAc_rcv)
+    
+    # Lactate 생성 (Ba만)
+    dLac = params_Ba['Y_lactate'] * (-dGlc)
+    
+    return [dX_Ba, dX_rcv, dGlc, dAc, dBut, dLac]
+
+# =============================================================================
+# 5. 시뮬레이션 실행
+# =============================================================================
+
+# 시간 범위 설정 (0-48시간, 100개 time points)
+t = np.linspace(0, 48, 100)
+
+# 초기 조건 (실험 조건 반영)
+X0 = 0.1      # 초기 biomass (g/L) - OD 0.7-0.8에 해당
+Glc0 = 27.0   # 초기 glucose (mM) - YCFA 배지
+Ac0 = 158.0   # 초기 acetate (mM) - YCFA 배지
+
+results = {}
+
+# --- 단독배양 시뮬레이션 ---
+
+# Ba 단독배양
+y0_Ba = [X0, Glc0, Ac0, 0]  # [Biomass, Glucose, Acetate, Lactate]
+sol_Ba = odeint(monoculture_Ba, y0_Ba, t, args=(params_Ba,))
+results['Ba'] = {
+    'time': t,
+    'biomass': sol_Ba[:, 0],
+    'glucose': sol_Ba[:, 1],
+    'acetate': sol_Ba[:, 2],
+    'butyrate': np.zeros_like(t),  # Ba는 butyrate 생성 안함
+    'lactate': sol_Ba[:, 3]
+}
+
+# Fpr 단독배양 (acetate만 제공)
+y0_Fpr = [X0, Ac0, 0]  # [Biomass, Acetate, Butyrate]
+sol_Fpr = odeint(monoculture_receiver, y0_Fpr, t, args=(params_Fpr,))
+results['Fpr'] = {
+    'time': t,
+    'biomass': sol_Fpr[:, 0],
+    'acetate': sol_Fpr[:, 1],
+    'butyrate': sol_Fpr[:, 2]
+}
+
+# Ac 단독배양
+y0_Ac = [X0, Ac0, 0]
+sol_Ac = odeint(monoculture_receiver, y0_Ac, t, args=(params_Ac,))
+results['Ac'] = {
+    'time': t,
+    'biomass': sol_Ac[:, 0],
+    'acetate': sol_Ac[:, 1],
+    'butyrate': sol_Ac[:, 2]
+}
+
+# Ar 단독배양
+y0_Ar = [X0, Ac0, 0]
+sol_Ar = odeint(monoculture_receiver, y0_Ar, t, args=(params_Ar,))
+results['Ar'] = {
+    'time': t,
+    'biomass': sol_Ar[:, 0],
+    'acetate': sol_Ar[:, 1],
+    'butyrate': sol_Ar[:, 2]
+}
+
+# --- 공배양 시뮬레이션 ---
+
+# Ba + Fpr 공배양
+y0_BaFpr = [X0, X0, Glc0, Ac0, 0, 0]  # [X_Ba, X_Fpr, Glc, Ac, But, Lac]
+sol_BaFpr = odeint(coculture_Ba_receiver, y0_BaFpr, t, args=(params_Ba, params_Fpr))
+results['Ba+Fpr'] = {
+    'time': t,
+    'biomass': sol_BaFpr[:, 0] + sol_BaFpr[:, 1],  # 총 biomass
+    'biomass_Ba': sol_BaFpr[:, 0],
+    'biomass_Fpr': sol_BaFpr[:, 1],
+    'glucose': sol_BaFpr[:, 2],
+    'acetate': sol_BaFpr[:, 3],
+    'butyrate': sol_BaFpr[:, 4],
+    'lactate': sol_BaFpr[:, 5]
+}
+
+# Ba + Ac 공배양
+y0_BaAc = [X0, X0, Glc0, Ac0, 0, 0]
+sol_BaAc = odeint(coculture_Ba_receiver, y0_BaAc, t, args=(params_Ba, params_Ac))
+results['Ba+Ac'] = {
+    'time': t,
+    'biomass': sol_BaAc[:, 0] + sol_BaAc[:, 1],
+    'butyrate': sol_BaAc[:, 4]
+}
+
+# Ba + Ar 공배양
+y0_BaAr = [X0, X0, Glc0, Ac0, 0, 0]
+sol_BaAr = odeint(coculture_Ba_receiver, y0_BaAr, t, args=(params_Ba, params_Ar))
+results['Ba+Ar'] = {
+    'time': t,
+    'biomass': sol_BaAr[:, 0] + sol_BaAr[:, 1],
+    'butyrate': sol_BaAr[:, 4]
+}
+
+# =============================================================================
+# 6. 결과 출력
+# =============================================================================
+
+print("="*70)
+print("시뮬레이션 결과 (48시간)")
+print("="*70)
+
+for label, res in results.items():
+    biomass_final = res['biomass'][-1]
+    butyrate_final = res['butyrate'][-1]
+    fold_change = biomass_final / res['biomass'][0]
+    
+    print(f"\n{label}:")
+    print(f"  Biomass: {biomass_final:.3f} g/L ({fold_change:.1f}x)")
+    print(f"  Butyrate: {butyrate_final:.3f} mM")
+
+# =============================================================================
+# 7. Cross-feeding 효과 분석
+# =============================================================================
+
+print("\n" + "="*70)
+print("Cross-feeding 효과 분석")
+print("="*70)
+
+coculture_pairs = [
+    ('Ba+Fpr', 'Ba', 'Fpr'),
+    ('Ba+Ac', 'Ba', 'Ac'),
+    ('Ba+Ar', 'Ba', 'Ar')
+]
+
+for co_label, s1, s2 in coculture_pairs:
+    # 단독배양 합
+    mono_sum_biomass = results[s1]['biomass'][-1] + results[s2]['biomass'][-1]
+    mono_sum_but = results[s1]['butyrate'][-1] + results[s2]['butyrate'][-1]
+    
+    # 공배양 결과
+    co_biomass = results[co_label]['biomass'][-1]
+    co_but = results[co_label]['butyrate'][-1]
+    
+    # 비교
+    biomass_ratio = co_biomass / mono_sum_biomass
+    but_ratio = co_but / mono_sum_but if mono_sum_but > 0 else 0
+    
+    print(f"\n{co_label}:")
+    print(f"  Biomass: 단독 합 {mono_sum_biomass:.3f} → 공배양 {co_biomass:.3f} ({biomass_ratio:.2f}x)")
+    print(f"  Butyrate: 단독 합 {mono_sum_but:.3f} → 공배양 {co_but:.3f} ({but_ratio:.2f}x)")
+    
+    if biomass_ratio > 1.05:
+        print(f"  → Synergy 효과 확인!")
+    elif biomass_ratio < 0.95:
+        print(f"  → Competition 효과")
+    else:
+        print(f"  → 상호작용 미미")
+
+# =============================================================================
+# 8. 결과 시각화
+# =============================================================================
+
+fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+
+colors = {
+    'Ba': '#1f77b4', 'Fpr': '#ff7f0e', 'Ac': '#2ca02c', 'Ar': '#d62728',
+    'Ba+Fpr': '#9467bd', 'Ba+Ac': '#8c564b', 'Ba+Ar': '#e377c2'
+}
+
+# Biomass
+ax = axes[0]
+for label in ['Ba', 'Fpr', 'Ac', 'Ar', 'Ba+Fpr', 'Ba+Ac', 'Ba+Ar']:
+    if label in results:
+        ls = '--' if '+' in label else '-'
+        lw = 3 if '+' in label else 2
+        ax.plot(results[label]['time'], results[label]['biomass'], 
+                label=label, color=colors[label], linestyle=ls, linewidth=lw)
+
+ax.set_xlabel('Time (h)')
+ax.set_ylabel('Biomass (g/L)')
+ax.set_title('Biomass Growth with Cross-feeding')
+ax.legend(ncol=2)
+ax.grid(True, alpha=0.3)
+
+# Butyrate
+ax = axes[1]
+for label in ['Ba', 'Fpr', 'Ac', 'Ar', 'Ba+Fpr', 'Ba+Ac', 'Ba+Ar']:
+    if label in results:
+        ls = '--' if '+' in label else '-'
+        lw = 3 if '+' in label else 2
+        ax.plot(results[label]['time'], results[label]['butyrate'], 
+                label=label, color=colors[label], linestyle=ls, linewidth=lw)
+
+ax.set_xlabel('Time (h)')
+ax.set_ylabel('Butyrate (mM)')
+ax.set_title('Butyrate Production')
+ax.legend(ncol=2)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('kinetic_model_results.png', dpi=300)
+plt.show()
+
+print("\n시뮬레이션 완료")
