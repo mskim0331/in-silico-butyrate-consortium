@@ -1,0 +1,311 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+
+print("="*70)
+print("Kinetic 모델 기반 공배양 시뮬레이션")
+print("="*70)
+
+# ============================================================================
+# 모델 파라미터 (문헌 기반)
+# ============================================================================
+
+# Bifidobacterium (Ba) - Glucose → Acetate/Lactate
+params_Ba = {
+    'mu_max': 0.5,      # 최대 성장률 (1/h)
+    'Ks_glc': 0.1,      # Glucose Monod constant (mM)
+    'Y_biomass': 0.5,   # Biomass yield (g/g)
+    'Y_acetate': 0.8,   # Acetate yield (mol/mol glucose)
+    'Y_lactate': 0.5,   # Lactate yield
+}
+
+# Faecalibacterium (Fpr) - Acetate → Butyrate
+params_Fpr = {
+    'mu_max': 0.3,      # 최대 성장률 (1/h)
+    'Ks_ac': 5.0,       # Acetate Monod constant (mM)
+    'Y_biomass': 0.3,   # Biomass yield
+    'Y_butyrate': 0.5,  # Butyrate yield (mol/mol acetate)
+}
+
+# Anaerostipes (Ac) - Acetate → Butyrate
+params_Ac = {
+    'mu_max': 0.25,
+    'Ks_ac': 8.0,
+    'Y_biomass': 0.25,
+    'Y_butyrate': 0.4,
+}
+
+# Agathobacter (Ar) - Acetate → Butyrate
+params_Ar = {
+    'mu_max': 0.28,
+    'Ks_ac': 6.0,
+    'Y_biomass': 0.28,
+    'Y_butyrate': 0.45,
+}
+
+# ============================================================================
+# 단독배양 모델
+# ============================================================================
+
+def monoculture_Ba(y, t, params):
+    """Ba 단독배양 ODE"""
+    X, Glc, Ac, Lac = y
+
+    # Monod growth
+    mu = params['mu_max'] * Glc / (params['Ks_glc'] + Glc)
+
+    # ODEs
+    dX = mu * X
+    dGlc = -mu * X / params['Y_biomass']
+    dAc = params['Y_acetate'] * (-dGlc)
+    dLac = params['Y_lactate'] * (-dGlc)
+
+    return [dX, dGlc, dAc, dLac]
+
+def monoculture_receiver(y, t, params):
+    """Fpr/Ac/Ar 단독배양 ODE"""
+    X, Ac, But = y
+
+    # Monod growth
+    mu = params['mu_max'] * Ac / (params['Ks_ac'] + Ac)
+
+    # ODEs
+    dX = mu * X
+    dAc = -mu * X / params['Y_biomass']
+    dBut = params['Y_butyrate'] * (-dAc)
+
+    return [dX, dAc, dBut]
+
+# ============================================================================
+# 공배양 모델 - Shared acetate pool!
+# ============================================================================
+
+def coculture_Ba_receiver(y, t, params_Ba, params_rcv):
+    X_Ba, X_rcv, Glc, Ac, But, Lac = y
+
+    # Ba growth (Glucose → Acetate)
+    mu_Ba = params_Ba['mu_max'] * Glc / (params_Ba['Ks_glc'] + Glc)
+
+    # Receiver growth (Acetate → Butyrate)
+    mu_rcv = params_rcv['mu_max'] * Ac / (params_rcv['Ks_ac'] + Ac)
+
+    # ODEs
+    dX_Ba = mu_Ba * X_Ba
+    dX_rcv = mu_rcv * X_rcv
+
+    dGlc = -mu_Ba * X_Ba / params_Ba['Y_biomass']
+
+    # Acetate: Ba 생산 - Receiver 소비 ← 핵심!
+    dAc_Ba = params_Ba['Y_acetate'] * (-dGlc)
+    dAc_rcv = -mu_rcv * X_rcv / params_rcv['Y_biomass']
+    dAc = dAc_Ba + dAc_rcv
+
+    dBut = params_rcv['Y_butyrate'] * (-dAc_rcv)
+    dLac = params_Ba['Y_lactate'] * (-dGlc)
+
+    return [dX_Ba, dX_rcv, dGlc, dAc, dBut, dLac]
+
+# ============================================================================
+# 시뮬레이션 실행
+# ============================================================================
+
+print("\n" + "="*70)
+print("시뮬레이션 실행 (48시간)")
+print("="*70)
+
+t = np.linspace(0, 48, 100)
+
+# 초기 조건
+X0 = 0.1      # g/L
+Glc0 = 27.0   # mM
+Ac0 = 158.0   # mM
+
+results = {}
+
+# === 단독배양 ===
+print("\n[단독배양]")
+
+# Ba
+y0_Ba = [X0, Glc0, Ac0, 0]
+sol_Ba = odeint(monoculture_Ba, y0_Ba, t, args=(params_Ba,))
+results['Ba'] = {
+    'time': t,
+    'biomass': sol_Ba[:, 0],
+    'glucose': sol_Ba[:, 1],
+    'acetate': sol_Ba[:, 2],
+    'butyrate': np.zeros_like(t),
+    'lactate': sol_Ba[:, 3]
+}
+print(f"  Ba: Biomass {sol_Ba[-1, 0]:.3f}, Acetate {sol_Ba[-1, 2]:.1f}")
+
+# Fpr
+y0_Fpr = [X0, Ac0, 0]
+sol_Fpr = odeint(monoculture_receiver, y0_Fpr, t, args=(params_Fpr,))
+results['Fpr'] = {
+    'time': t,
+    'biomass': sol_Fpr[:, 0],
+    'acetate': sol_Fpr[:, 1],
+    'butyrate': sol_Fpr[:, 2]
+}
+print(f"  Fpr: Biomass {sol_Fpr[-1, 0]:.3f}, Butyrate {sol_Fpr[-1, 2]:.1f}")
+
+# Ac
+y0_Ac = [X0, Ac0, 0]
+sol_Ac = odeint(monoculture_receiver, y0_Ac, t, args=(params_Ac,))
+results['Ac'] = {
+    'time': t,
+    'biomass': sol_Ac[:, 0],
+    'acetate': sol_Ac[:, 1],
+    'butyrate': sol_Ac[:, 2]
+}
+print(f"  Ac: Biomass {sol_Ac[-1, 0]:.3f}, Butyrate {sol_Ac[-1, 2]:.1f}")
+
+# Ar
+y0_Ar = [X0, Ac0, 0]
+sol_Ar = odeint(monoculture_receiver, y0_Ar, t, args=(params_Ar,))
+results['Ar'] = {
+    'time': t,
+    'biomass': sol_Ar[:, 0],
+    'acetate': sol_Ar[:, 1],
+    'butyrate': sol_Ar[:, 2]
+}
+print(f"  Ar: Biomass {sol_Ar[-1, 0]:.3f}, Butyrate {sol_Ar[-1, 2]:.1f}")
+
+# === 공배양 ===
+print("\n[공배양 - Cross-feeding]")
+
+# Ba + Fpr
+y0_BaFpr = [X0, X0, Glc0, Ac0, 0, 0]
+sol_BaFpr = odeint(coculture_Ba_receiver, y0_BaFpr, t, args=(params_Ba, params_Fpr))
+results['Ba+Fpr'] = {
+    'time': t,
+    'biomass': sol_BaFpr[:, 0] + sol_BaFpr[:, 1],
+    'biomass_Ba': sol_BaFpr[:, 0],
+    'biomass_Fpr': sol_BaFpr[:, 1],
+    'glucose': sol_BaFpr[:, 2],
+    'acetate': sol_BaFpr[:, 3],
+    'butyrate': sol_BaFpr[:, 4],
+    'lactate': sol_BaFpr[:, 5]
+}
+print(f"  Ba+Fpr: Biomass {sol_BaFpr[-1, 0] + sol_BaFpr[-1, 1]:.3f}, Butyrate {sol_BaFpr[-1, 4]:.1f}")
+
+# Ba + Ac
+y0_BaAc = [X0, X0, Glc0, Ac0, 0, 0]
+sol_BaAc = odeint(coculture_Ba_receiver, y0_BaAc, t, args=(params_Ba, params_Ac))
+results['Ba+Ac'] = {
+    'time': t,
+    'biomass': sol_BaAc[:, 0] + sol_BaAc[:, 1],
+    'butyrate': sol_BaAc[:, 4]
+}
+print(f"  Ba+Ac: Biomass {sol_BaAc[-1, 0] + sol_BaAc[-1, 1]:.3f}, Butyrate {sol_BaAc[-1, 4]:.1f}")
+
+# Ba + Ar
+y0_BaAr = [X0, X0, Glc0, Ac0, 0, 0]
+sol_BaAr = odeint(coculture_Ba_receiver, y0_BaAr, t, args=(params_Ba, params_Ar))
+results['Ba+Ar'] = {
+    'time': t,
+    'biomass': sol_BaAr[:, 0] + sol_BaAr[:, 1],
+    'butyrate': sol_BaAr[:, 4]
+}
+print(f"  Ba+Ar: Biomass {sol_BaAr[-1, 0] + sol_BaAr[-1, 1]:.3f}, Butyrate {sol_BaAr[-1, 4]:.1f}")
+
+# ============================================================================
+# Cross-feeding 효과 분석
+# ============================================================================
+
+print("\n" + "="*70)
+print("Cross-feeding 효과")
+print("="*70)
+
+comparisons = [
+    ('Ba+Fpr', 'Ba', 'Fpr'),
+    ('Ba+Ac', 'Ba', 'Ac'),
+    ('Ba+Ar', 'Ba', 'Ar')
+]
+
+for co, s1, s2 in comparisons:
+    mono_sum_bio = results[s1]['biomass'][-1] + results[s2]['biomass'][-1]
+    mono_sum_but = results[s1].get('butyrate', np.zeros(1))[-1] + results[s2]['butyrate'][-1]
+
+    co_bio = results[co]['biomass'][-1]
+    co_but = results[co]['butyrate'][-1]
+
+    print(f"\n{co}:")
+    print(f"  Biomass: {mono_sum_bio:.3f} (단독) → {co_bio:.3f} (공배양) = {co_bio/mono_sum_bio:.2f}x")
+    print(f"  Butyrate: {mono_sum_but:.1f} (단독) → {co_but:.1f} (공배양) = {co_but/mono_sum_but:.2f}x")
+
+    if co_bio > mono_sum_bio * 1.05:
+        print(f"Synergy 효과 있음")
+    else:
+        print(f"Synergy 효과 없음")
+
+# ============================================================================
+# 그래프
+# ============================================================================
+
+print("\n[그래프 생성]")
+
+fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+fig.suptitle('Kinetic Model: Cross-feeding Simulation', fontsize=16, fontweight='bold')
+
+colors = {
+    'Ba': '#1f77b4', 'Fpr': '#ff7f0e', 'Ac': '#2ca02c', 'Ar': '#d62728',
+    'Ba+Fpr': '#9467bd', 'Ba+Ac': '#8c564b', 'Ba+Ar': '#e377c2'
+}
+
+# Biomass
+ax = axes[0]
+for label in ['Ba', 'Fpr', 'Ac', 'Ar', 'Ba+Fpr', 'Ba+Ac', 'Ba+Ar']:
+    if label in results:
+        ls = '--' if '+' in label else '-'
+        lw = 3 if '+' in label else 2
+        ax.plot(results[label]['time'], results[label]['biomass'],
+                label=label, color=colors[label], linestyle=ls, linewidth=lw)
+
+ax.set_xlabel('Time (h)', fontsize=12)
+ax.set_ylabel('Biomass (g/L)', fontsize=12)
+ax.set_title('Biomass Growth with Cross-feeding', fontweight='bold')
+ax.legend(ncol=2, fontsize=10)
+ax.grid(True, alpha=0.3)
+
+# Butyrate
+ax = axes[1]
+for label in ['Ba', 'Fpr', 'Ac', 'Ar', 'Ba+Fpr', 'Ba+Ac', 'Ba+Ar']:
+    if label in results:
+        ls = '--' if '+' in label else '-'
+        lw = 3 if '+' in label else 2
+        ax.plot(results[label]['time'], results[label]['butyrate'],
+                label=label, color=colors[label], linestyle=ls, linewidth=lw)
+
+ax.set_xlabel('Time (h)', fontsize=12)
+ax.set_ylabel('Butyrate (mM)', fontsize=12)
+ax.set_title('Butyrate Production', fontweight='bold')
+ax.legend(ncol=2, fontsize=10)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# 최종 요약
+# ============================================================================
+
+print("\n" + "="*70)
+print("최종 결과")
+print("="*70)
+
+summary = []
+for label in ['Ba', 'Fpr', 'Ac', 'Ar', 'Ba+Fpr', 'Ba+Ac', 'Ba+Ar']:
+    if label in results:
+        fold = results[label]['biomass'][-1] / results[label]['biomass'][0]
+        summary.append({
+            'Condition': label,
+            'Biomass_0h': f"{results[label]['biomass'][0]:.3f}",
+            'Biomass_48h': f"{results[label]['biomass'][-1]:.3f}",
+            'Fold_Change': f"{fold:.1f}x",
+            'Butyrate_48h': f"{results[label]['butyrate'][-1]:.1f}"
+        })
+
+df = pd.DataFrame(summary)
+print("\n" + df.to_string(index=False))
