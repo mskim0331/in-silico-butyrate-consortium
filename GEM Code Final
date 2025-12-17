@@ -1,0 +1,329 @@
+!pip install cobra
+
+import urllib.request
+import cobra
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# AGORA2 모델 다운로드
+# =============================================================================
+
+base_url = "https://vmh.life/files/reconstructions/AGORA2/version2.01/sbml_files/individual_reconstructions/"
+
+# 실험에 사용한 4개 균주의 모델 정보
+models_info = {
+    'Ba': {
+        'name': 'Bifidobacterium adolescentis',
+        'file': 'Bifidobacterium_adolescentis_ATCC_15703.xml',
+    },
+    'Fpr': {
+        'name': 'Faecalibacterium prausnitzii',
+        'file': 'Faecalibacterium_prausnitzii_ERR1022279.xml',
+    },
+    'Ac': {
+        'name': 'Anaerostipes caccae',
+        'file': 'Anaerostipes_caccae_DSM_14662.xml',
+    },
+    'Ar': {
+        'name': 'Agathobacter rectalis',
+        'file': 'Eubacterium_rectale_ATCC_33656.xml',
+    }
+}
+
+
+downloaded = {}
+for strain_id, info in models_info.items():
+    try:
+        url = base_url + info['file']
+        filename = f"{strain_id}.xml"
+        urllib.request.urlretrieve(url, filename)
+        downloaded[strain_id] = filename
+        print(f"✓ {strain_id} 다운로드 완료")
+    except Exception as e:
+        print(f"✗ {strain_id} 다운로드 실패: {e}")
+
+# =============================================================================
+# 모델 로드 및 검증
+# =============================================================================
+
+models = {}
+for strain_id, filename in downloaded.items():
+    try:
+        # SBML 파일 읽기
+        model = cobra.io.read_sbml_model(filename)
+        models[strain_id] = model
+        
+        # 모델 기본 정보 출력
+        print(f"\n{strain_id} ({models_info[strain_id]['name']}):")
+        print(f"  Reactions: {len(model.reactions)}")
+        print(f"  Metabolites: {len(model.metabolites)}")
+        print(f"  Genes: {len(model.genes)}")
+        
+    except Exception as e:
+        print(f"X {strain_id} 로드 실패: {e}")
+
+# =============================================================================
+# Butyrate Exchange Reaction 확인
+# =============================================================================
+
+butyrate_rxns = {}
+for strain_id, model in models.items():
+    # 'but'이 포함된 exchange reactions 검색
+    but_exchanges = [r for r in model.exchanges if 'but' in r.id.lower()]
+    
+    print(f"\n{strain_id} Butyrate exchanges:")
+    for rxn in but_exchanges:
+        print(f"  {rxn.id}: {rxn.name}")
+        # AGORA2에서 진짜 butyrate exchange는 보통 EX_but(e)
+        if 'EX_but(e)' == rxn.id:
+            butyrate_rxns[strain_id] = rxn.id
+
+# =============================================================================
+# YCFA+FOS 배지 설정 함수
+# =============================================================================
+
+def setup_ycfos_medium(model):
+    """
+    실험에 사용한 YCFA+FOS 배지 조성을 모델에 적용
+    
+    YCFA 배지 주요 성분:
+    - Carbon source: Glucose (5 g/L), FOS (8 g/L)
+    - SCFA: Acetate (158 mM), Propionate (47 mM)
+    - Nitrogen: Casitone (10 g/L), Yeast extract (2.5 g/L)
+    - Vitamins: Biotin, Folic acid, B6, B1, B2, etc.
+    - Anaerobic conditions (O2 = 0)
+    """
+    
+    # 기본 medium을 가져와서 수정하는 방식 사용
+    medium = model.medium.copy()
+    
+    # Anaerobic 조건 설정: 산소 제거
+    if 'EX_o2(e)' in medium:
+        del medium['EX_o2(e)']
+    
+    # YCFA 주요 성분 추가
+    # Glucose (주 탄소원)
+    for glc_id in ['EX_glc__D(e)', 'EX_glc_D(e)']:
+        if glc_id in [r.id for r in model.reactions]:
+            medium[glc_id] = 10.0  # mmol/gDW/h (flux 단위)
+            break
+    
+    # Acetate (SCFA mixture에서 제공)
+    for ac_id in ['EX_ac(e)', 'EX_ac_e']:
+        if ac_id in [r.id for r in model.reactions]:
+            medium[ac_id] = 10.0
+            break
+    
+    # Propionate
+    for prop_id in ['EX_ppa(e)', 'EX_ppa_e']:
+        if prop_id in [r.id for r in model.reactions]:
+            medium[prop_id] = 5.0
+            break
+    
+    # FOS (fructose로 근사)
+    for fos_id in ['EX_fru(e)', 'EX_fru_e']:
+        if fos_id in [r.id for r in model.reactions]:
+            medium[fos_id] = 5.0
+            break
+    
+    # Medium 적용
+    model.medium = medium
+    
+    # Oxygen을 완전히 차단 (double check)
+    for o2_id in ['EX_o2(e)', 'EX_o2_e']:
+        if o2_id in [r.id for r in model.reactions]:
+            model.reactions.get_by_id(o2_id).lower_bound = 0
+            model.reactions.get_by_id(o2_id).upper_bound = 0
+    
+    return model
+
+# =============================================================================
+# 단독배양 dFBA 시뮬레이션
+# =============================================================================
+def dfba_monoculture(model, strain_id, butyrate_rxn_id, time_hours=48):
+    
+    dt = 1.0  # Time step: 1시간
+    time_points = np.arange(0, time_hours + dt, dt)
+    
+    # 초기 조건
+    biomass = 0.1  # g/L (실험의 초기 OD를 biomass로 환산)
+    butyrate = 0.0  # mM
+    
+    # 결과 저장용 dictionary
+    results = {
+        'time': [0],
+        'biomass': [biomass],
+        'butyrate': [butyrate]
+    }
+    
+    # 시간에 따른 시뮬레이션
+    for t in time_points[1:]:
+        # 각 time step마다 새로운 모델 복사본 생성
+        model_copy = model.copy()
+        
+        # 배지 설정
+        setup_ycfos_medium(model_copy)
+        
+        try:
+            
+            solution = model_copy.optimize()
+            
+            # 최적화 성공 여부 확인
+            if solution.status == 'optimal' and solution.objective_value > 1e-6:
+                # Growth rate (h^-1)
+                growth_rate = solution.objective_value
+                growth_rate_scaled = growth_rate * 0.001
+                
+                # Butyrate flux 추출
+                but_flux = 0
+                if butyrate_rxn_id and butyrate_rxn_id in solution.fluxes.index:
+                    but_flux = solution.fluxes[butyrate_rxn_id]
+                
+                # Biomass 업데이트
+                biomass = biomass * (1 + growth_rate_scaled * dt)
+                
+                # Butyrate 축적
+                butyrate += max(0, but_flux * biomass * dt)
+        
+        except Exception as e:
+            # FBA 실패 시 (infeasible 등) 성장 없음으로 처리
+            pass
+        
+        # 결과 저장
+        results['time'].append(t)
+        results['biomass'].append(biomass)
+        results['butyrate'].append(butyrate)
+    
+    return results
+
+# =============================================================================
+# 공배양 dFBA 시뮬레이션
+# =============================================================================
+def dfba_coculture(model1, model2, s1_id, s2_id, but1_rxn, but2_rxn, time_hours=48):
+    
+    dt = 1.0
+    time_points = np.arange(0, time_hours + dt, dt)
+    
+    # 각 균주의 초기 biomass
+    biomass1 = 0.1
+    biomass2 = 0.1
+    butyrate = 0.0
+    
+    results = {
+        'time': [0],
+        'biomass': [biomass1 + biomass2],
+        'butyrate': [butyrate]
+    }
+    
+    for t in time_points[1:]:
+        # Strain 1 시뮬레이션
+        m1 = model1.copy()
+        setup_ycfos_medium(m1)
+        
+        try:
+            sol1 = m1.optimize()
+            if sol1.status == 'optimal' and sol1.objective_value > 1e-6:
+                gr1 = sol1.objective_value * 0.001
+                but1 = sol1.fluxes.get(but1_rxn, 0) if but1_rxn else 0
+                biomass1 = biomass1 * (1 + gr1 * dt)
+                butyrate += max(0, but1 * biomass1 * dt)
+        except:
+            pass
+        
+        # Strain 2 시뮬레이션
+        m2 = model2.copy()
+        setup_ycfos_medium(m2)
+        
+        try:
+            sol2 = m2.optimize()
+            if sol2.status == 'optimal' and sol2.objective_value > 1e-6:
+                gr2 = sol2.objective_value * 0.001
+                but2 = sol2.fluxes.get(but2_rxn, 0) if but2_rxn else 0
+                biomass2 = biomass2 * (1 + gr2 * dt)
+                butyrate += max(0, but2 * biomass2 * dt)
+        except:
+            pass
+        
+        results['time'].append(t)
+        results['biomass'].append(biomass1 + biomass2)
+        results['butyrate'].append(butyrate)
+    
+    return results
+
+# =============================================================================
+# 시뮬레이션 실행
+# =============================================================================
+print("\n단독배양 시뮬레이션:")
+mono_results = {}
+
+for strain_id in ['Ba', 'Fpr', 'Ac', 'Ar']:
+    if strain_id in models:
+        but_rxn = butyrate_rxns.get(strain_id)
+        results = dfba_monoculture(models[strain_id], strain_id, but_rxn)
+        mono_results[strain_id] = results
+        print(f"{strain_id}: Biomass {results['biomass'][-1]:.3f} g/L, "
+              f"Butyrate {results['butyrate'][-1]:.3f} mM")
+
+print("\n공배양 시뮬레이션:")
+co_results = {}
+
+cocultures = [
+    ('Ba', 'Fpr', 'Ba+Fpr'),
+    ('Ba', 'Ac', 'Ba+Ac'),
+    ('Ba', 'Ar', 'Ba+Ar')
+]
+
+for s1, s2, label in cocultures:
+    if s1 in models and s2 in models:
+        results = dfba_coculture(
+            models[s1], models[s2], s1, s2,
+            butyrate_rxns.get(s1), butyrate_rxns.get(s2)
+        )
+        co_results[label] = results
+        print(f"{label}: Biomass {results['biomass'][-1]:.3f} g/L, "
+              f"Butyrate {results['butyrate'][-1]:.3f} mM")
+
+# =============================================================================
+# 결과 시각화
+# =============================================================================
+fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+
+all_results = {**mono_results, **co_results}
+colors = {
+    'Ba': '#1f77b4', 'Fpr': '#ff7f0e', 'Ac': '#2ca02c', 'Ar': '#d62728',
+    'Ba+Fpr': '#9467bd', 'Ba+Ac': '#8c564b', 'Ba+Ar': '#e377c2'
+}
+
+# Biomass 그래프
+ax = axes[0]
+for label, res in all_results.items():
+    linestyle = '--' if '+' in label else '-'
+    linewidth = 3 if '+' in label else 2
+    ax.plot(res['time'], res['biomass'], label=label, 
+            color=colors[label], linestyle=linestyle, linewidth=linewidth)
+ax.set_xlabel('Time (h)')
+ax.set_ylabel('Biomass (g/L)')
+ax.set_title('Biomass Growth')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Butyrate 그래프
+ax = axes[1]
+for label, res in all_results.items():
+    linestyle = '--' if '+' in label else '-'
+    linewidth = 3 if '+' in label else 2
+    ax.plot(res['time'], res['butyrate'], label=label, 
+            color=colors[label], linestyle=linestyle, linewidth=linewidth)
+ax.set_xlabel('Time (h)')
+ax.set_ylabel('Butyrate (mM)')
+ax.set_title('Butyrate Production')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('gem_dfba_results.png', dpi=300)
+plt.show()
+
+print("\n시뮬레이션 완료")
